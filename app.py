@@ -10,7 +10,12 @@ from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
+
+from settlement_calc import (VALID_ITEM_STATUS, CalcError, approval_blockers,
+                             item_payout, split_settlement, validate_item_fields,
+                             validate_shares)
+from settlement_store import SettlementStore, StoreError
 
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
@@ -69,6 +74,7 @@ class CatastropheClaimService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
         self._init_schema()
+        self.settlements = SettlementStore(self.db_path)
 
     def connect(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path, timeout=10)
@@ -409,6 +415,131 @@ class CatastropheClaimService:
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
 
+    # ---- 逐项定损与共保结算：存储在 settlement_store，计算在 settlement_calc ----
+
+    SETTLEMENT_ROLES = {"intake", "adjuster", "surveyor", "supervisor", "auditor"}
+
+    def _settlement_claim(self, conn: sqlite3.Connection, claim_id: int) -> sqlite3.Row:
+        claim = self.settlements.claim_row(conn, claim_id)
+        if claim["status"] not in {"review", "approved"}:
+            raise DomainError("案件进入复核环节后才能维护定损", 409)
+        return claim
+
+    def create_settlement_version(self, actor: str, role: str, claim_id: int, note: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "创建定损版本")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            self.settlements.create_version(conn, claim_id, actor, str(note or ""), utcnow())
+            detail = self.settlements.current_detail(conn, claim_id)
+            self._audit(conn, claim_id, actor, "settlement.version_created",
+                        {"version_no": detail["version"]["version_no"], "note": str(note or "").strip()})
+            return detail
+
+    def add_settlement_item(self, actor: str, role: str, claim_id: int, item_name: str,
+                            insured_amount: float, loss_ratio: float,
+                            salvage_value: float = 0, deductible: float = 0) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "supervisor"}, "维护定损项")
+        fields = validate_item_fields({
+            "item_name": item_name, "insured_amount": insured_amount, "loss_ratio": loss_ratio,
+            "salvage_value": salvage_value, "deductible": deductible,
+        })
+        payout = item_payout(fields)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            item = self.settlements.add_item(conn, claim_id, fields, payout, actor, utcnow())
+            self._audit(conn, claim_id, actor, "settlement.item_added",
+                        {"item_id": item["id"], "item_name": fields["item_name"], "payout": payout})
+            return item
+
+    def review_settlement_item(self, actor: str, role: str, claim_id: int, item_id: int,
+                               review_status: str = "reviewed") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "supervisor"}, "复核定损项")
+        if review_status not in VALID_ITEM_STATUS:
+            raise DomainError("复核状态无效")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            item = self.settlements.set_item_review(conn, claim_id, int(item_id), review_status, actor, utcnow())
+            self._audit(conn, claim_id, actor, "settlement.item_reviewed",
+                        {"item_id": item["id"], "review_status": review_status})
+            return item
+
+    def remove_settlement_item(self, actor: str, role: str, claim_id: int, item_id: int) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "supervisor"}, "删除定损项")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            item = self.settlements.remove_item(conn, claim_id, int(item_id))
+            self._audit(conn, claim_id, actor, "settlement.item_removed",
+                        {"item_id": item["id"], "item_name": item["item_name"]})
+            return item
+
+    def set_coinsurance_shares(self, actor: str, role: str, claim_id: int,
+                               shares: list[dict[str, Any]]) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "维护共保份额")
+        if not isinstance(shares, list):
+            raise DomainError("共保份额必须是列表")
+        normalized = validate_shares(shares)
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            saved = self.settlements.replace_shares(conn, claim_id, normalized, actor, utcnow())
+            self._audit(conn, claim_id, actor, "settlement.shares_updated",
+                        {"insurers": [s["insurer"] for s in normalized],
+                         "total_pct": round(sum(s["share_pct"] for s in normalized), 6)})
+            return {"shares": saved}
+
+    def finalize_settlement(self, actor: str, role: str, claim_id: int) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "核定结算")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._settlement_claim(conn, claim_id)
+            detail = self.settlements.current_detail(conn, claim_id)
+            if not detail:
+                raise DomainError("尚无定损版本，请先创建并维护定损项", 409)
+            if detail["version"]["status"] != "draft":
+                raise DomainError("当前定损版本已核定冻结，如需补证请创建新版本", 409)
+            blockers = approval_blockers(detail["items"], detail["shares"])
+            if blockers:
+                raise DomainError("无法核定：" + "；".join(blockers), 409)
+            split = split_settlement(detail["items"], detail["shares"])
+            result = self.settlements.finalize_snapshot(
+                conn, claim_id, split["lines"], split["total_payout"], actor, utcnow())
+            conn.execute(
+                "UPDATE claims SET final_payout=?,version=version+1,updated_at=? WHERE id=?",
+                (split["total_payout"], utcnow(), claim_id),
+            )
+            self._audit(conn, claim_id, actor, "settlement.finalized",
+                        {"version_no": result["version"]["version_no"], "total_payout": split["total_payout"]})
+            return result
+
+    def get_settlement(self, actor: str, role: str, claim_id: int,
+                       version_no: int | None = None) -> dict[str, Any]:
+        require_role(role, self.SETTLEMENT_ROLES, "查看定损结算")
+        with self.connect() as conn:
+            claim = self.settlements.claim_row(conn, claim_id)
+            if version_no is not None:
+                detail = self.settlements.version_detail(conn, claim_id, int(version_no))
+            else:
+                detail = self.settlements.current_detail(conn, claim_id)
+        blockers = None
+        if detail and detail["version"]["status"] == "draft":
+            blockers = approval_blockers(detail["items"], detail["shares"])
+        return {"claim": dict(claim), "settlement": detail, "blockers": blockers}
+
+    def list_settlement_versions(self, actor: str, role: str, claim_id: int) -> dict[str, Any]:
+        require_role(role, self.SETTLEMENT_ROLES, "查看定损版本")
+        with self.connect() as conn:
+            return {"versions": self.settlements.list_versions(conn, claim_id)}
+
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
             raise DomainError("角色无权查看理赔队列", 403)
@@ -439,9 +570,17 @@ class CatastropheClaimService:
                 evidence = [dict(r) for r in conn.execute("SELECT * FROM evidence WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 payments = [dict(r) for r in conn.execute("SELECT * FROM payments WHERE claim_id IN (%s) ORDER BY id DESC" % marks, ids).fetchall()]
                 timeline = [dict(r) for r in conn.execute("SELECT * FROM timeline WHERE claim_id IN (%s) ORDER BY id DESC LIMIT 300" % marks, ids).fetchall()]
+                versions = conn.execute(
+                    "SELECT * FROM settlement_versions WHERE claim_id IN (%s) ORDER BY claim_id,version_no DESC" % marks, ids
+                ).fetchall()
+                latest: dict[int, sqlite3.Row] = {}
+                for row in versions:
+                    latest.setdefault(row["claim_id"], row)
+                settlements = [dict(v) for v in latest.values()]
             else:
-                evidence, payments, timeline = [], [], []
-        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline, "access_limited": False}
+                evidence, payments, timeline, settlements = [], [], [], []
+        return {"claims": claims, "evidence": evidence, "payments": payments, "timeline": timeline,
+                "settlements": settlements, "access_limited": False}
 
     def seed_demo(self) -> dict[str, Any]:
         with self.connect() as conn:
@@ -449,7 +588,29 @@ class CatastropheClaimService:
                 return {"seeded": False, "reason": "已有数据"}
         c1 = self.create_claim("intake-demo", "intake", "CLM-DEMO-001", "TY2026", "沿海A区", "洪水", "P-1001", "R-01", 30.1, 121.2, 500000, True, True)
         self.create_claim("intake-demo", "intake", "CLM-DEMO-002", "TY2026", "沿海A区", "洪水", "P-1002", "R-02", 30.2, 121.3, 240000, False, False)
-        return {"seeded": True, "first_claim_id": c1["id"]}
+        # 演示：c1 走完查勘复核，完成一版逐项定损核定，之后补证生成第二版草稿
+        c1 = self.triage_claim("sup-demo", "supervisor", c1["id"], c1["version"], 0.2, False)
+        c1 = self.assign_claim("sup-demo", "supervisor", c1["id"], "adjuster-demo", c1["version"], "surveyor-demo")
+        c1 = self.record_survey("adjuster-demo", "adjuster", c1["id"], 0.6, "厂房进水，结构受损", "按定损赔付", c1["version"])
+        c1 = self.submit_review("adjuster-demo", "adjuster", c1["id"], c1["version"])
+        self.create_settlement_version("sup-demo", "supervisor", c1["id"], "首次定损")
+        i1 = self.add_settlement_item("adjuster-demo", "adjuster", c1["id"], "厂房主体", 400000, 0.6, 20000, 50000)
+        i2 = self.add_settlement_item("adjuster-demo", "adjuster", c1["id"], "库存物资", 150000, 0.8, 5000, 10000)
+        self.review_settlement_item("adjuster-demo", "adjuster", c1["id"], i1["id"], "reviewed")
+        self.review_settlement_item("adjuster-demo", "adjuster", c1["id"], i2["id"], "reviewed")
+        self.set_coinsurance_shares("sup-demo", "supervisor", c1["id"], [
+            {"insurer": "人保财险", "share_pct": 50},
+            {"insurer": "平安产险", "share_pct": 30},
+            {"insurer": "太保产险", "share_pct": 20},
+        ])
+        v1 = self.finalize_settlement("sup-demo", "supervisor", c1["id"])
+        with self.connect() as conn:
+            c1 = dict(self._claim(conn, c1["id"]))
+        self.finalize_claim("sup-demo", "supervisor", c1["id"], "approve",
+                            v1["version"]["total_payout"], c1["version"])
+        self.create_settlement_version("sup-demo", "supervisor", c1["id"], "补证：新增设备损失")
+        self.add_settlement_item("adjuster-demo", "adjuster", c1["id"], "生产设备", 200000, 0.3, 10000, 20000)
+        return {"seeded": True, "first_claim_id": c1["id"], "settlement_total": v1["version"]["total_payout"]}
 
 
 class ApiHandler(BaseHTTPRequestHandler):
@@ -482,9 +643,18 @@ class ApiHandler(BaseHTTPRequestHandler):
 
     def do_GET(self) -> None:
         try:
-            path = urlparse(self.path).path
+            parsed = urlparse(self.path)
+            path, query = parsed.path, parse_qs(parsed.query)
             if path in {"/", "/index.html"}:
                 body = (ROOT / "static" / "index.html").read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+                return
+            if path in {"/settlement", "/settlement.html"}:
+                body = (ROOT / "static" / "settlement.html").read_bytes()
                 self.send_response(200)
                 self.send_header("Content-Type", "text/html; charset=utf-8")
                 self.send_header("Content-Length", str(len(body)))
@@ -498,10 +668,30 @@ class ApiHandler(BaseHTTPRequestHandler):
             elif path == "/api/queue":
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
+            elif path == "/api/settlements":
+                actor, role = self._headers()
+                claim_id = query.get("claim_id", [""])[0]
+                if not claim_id:
+                    raise DomainError("缺少 claim_id 参数")
+                version = query.get("version", [None])[0]
+                self._send(200, self.service.get_settlement(
+                    actor, role, int(claim_id), int(version) if version else None))
+            elif path == "/api/settlements/versions":
+                actor, role = self._headers()
+                claim_id = query.get("claim_id", [""])[0]
+                if not claim_id:
+                    raise DomainError("缺少 claim_id 参数")
+                self._send(200, self.service.list_settlement_versions(actor, role, int(claim_id)))
             else:
                 self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
             self._send(exc.status, {"error": str(exc)})
+        except (CalcError, StoreError) as exc:
+            self._send(getattr(exc, "status", 400), {"error": str(exc)})
+        except (TypeError, ValueError) as exc:
+            self._send(400, {"error": "请求参数错误: %s" % exc})
+        except Exception as exc:
+            self._send(500, {"error": "服务器内部错误", "detail": str(exc)})
 
     def do_POST(self) -> None:
         try:
@@ -522,11 +712,25 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/settlements/version":
+                result = self.service.create_settlement_version(actor, role, **data)
+            elif path == "/api/settlements/items":
+                result = self.service.add_settlement_item(actor, role, **data)
+            elif path == "/api/settlements/items/review":
+                result = self.service.review_settlement_item(actor, role, **data)
+            elif path == "/api/settlements/items/remove":
+                result = self.service.remove_settlement_item(actor, role, **data)
+            elif path == "/api/settlements/shares":
+                result = self.service.set_coinsurance_shares(actor, role, **data)
+            elif path == "/api/settlements/finalize":
+                result = self.service.finalize_settlement(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
             self._send(exc.status, {"error": str(exc)})
+        except (CalcError, StoreError) as exc:
+            self._send(getattr(exc, "status", 400), {"error": str(exc)})
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
         except Exception as exc:

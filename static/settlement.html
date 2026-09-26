@@ -1,0 +1,216 @@
+<!doctype html><html lang="zh-CN"><meta charset="utf-8"><title>逐项定损与共保结算</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}
+table{border-collapse:collapse;width:100%;margin:14px 0}th,td{border:1px solid #d3dce3;padding:7px}th{background:#f1f5f7}
+.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px;margin:14px 0}
+.blockers{background:#fdecea;border-left:5px solid #c0392b;padding:12px 16px;margin:14px 0}
+.blockers li{color:#8e2a1e}
+.ok{background:#eaf6ec;border-left:5px solid #27ae60;padding:12px 16px;margin:14px 0}
+code{background:#eef2f4;padding:2px 5px}input,select,button{font:inherit;padding:4px 8px;margin:2px}
+button{cursor:pointer}.muted{color:#7a8a96}.num{text-align:right;font-variant-numeric:tabular-nums}
+.badge{display:inline-block;padding:1px 8px;border-radius:10px;font-size:13px}
+.badge.draft{background:#fdf0d5;color:#8a6d1a}.badge.finalized{background:#d9ead3;color:#2d6a2d}
+.err{background:#fdecea;border:1px solid #e5b4ae;padding:8px 12px;margin:10px 0;display:none;white-space:pre-wrap}
+.bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;margin:10px 0}
+h2{margin-top:28px}tfoot td{font-weight:700;background:#f7fafb}
+</style>
+<h1>逐项定损与共保结算</h1>
+<div class="card">每案维护受损标的（保额、损失比例、残值、免赔额），核定后按共保份额生成结算明细并冻结；补证请新建版本，旧版本结算仍可查。计算与存储分别在 <code>settlement_calc.py</code> / <code>settlement_store.py</code>。</div>
+<div class="bar">
+  <label>操作人 <input id="user" value="sup-demo" size="10"></label>
+  <label>角色 <select id="role">
+    <option>supervisor</option><option>adjuster</option><option>surveyor</option><option>intake</option><option>auditor</option>
+  </select></label>
+  <label>案件 ID <input id="claimId" type="number" min="1" value="1" style="width:6em"></label>
+  <button id="loadBtn">加载</button>
+  <span id="claimInfo" class="muted"></span>
+</div>
+<div class="err" id="err"></div>
+<div id="main" style="display:none">
+  <div class="bar">
+    <label>定损版本 <select id="versionSel"></select></label>
+    <span id="versionBadge"></span>
+    <button id="newVersionBtn">新建版本（补证）</button>
+    <span id="versionMeta" class="muted"></span>
+  </div>
+  <div class="blockers" id="blockersBox" style="display:none"><b>暂不能核定，缺少/未满足：</b><ul id="blockers"></ul></div>
+  <div class="ok" id="readyBox" style="display:none">定损项均已复核、共保份额合计 100%，可以核定。</div>
+
+  <h2>定损项</h2>
+  <table id="items"><thead><tr><th>受损标的</th><th>保额</th><th>损失比例</th><th>残值</th><th>免赔额</th><th>赔款</th><th>复核</th><th class="editOnly">操作</th></tr></thead>
+  <tbody></tbody><tfoot><tr><td>合计</td><td class="num" id="sumInsured"></td><td></td><td></td><td></td><td class="num" id="sumPayout"></td><td colspan="2"></td></tr></tfoot></table>
+  <div id="itemForm" class="bar">
+    <input id="itName" placeholder="受损标的名称" size="14">
+    <input id="itInsured" type="number" min="0" placeholder="保额" style="width:8em">
+    <input id="itRatio" type="number" min="0" max="1" step="0.01" placeholder="损失比例 0-1" style="width:8em">
+    <input id="itSalvage" type="number" min="0" placeholder="残值" style="width:7em">
+    <input id="itDeduct" type="number" min="0" placeholder="免赔额" style="width:7em">
+    <button id="addItemBtn">添加定损项</button>
+  </div>
+
+  <h2>共保份额</h2>
+  <table id="shares"><thead><tr><th>共保人</th><th>份额 %</th><th class="editOnly">操作</th></tr></thead>
+  <tbody></tbody><tfoot><tr><td>合计</td><td class="num" id="sumShare"></td><td class="editOnly"></td></tr></tfoot></table>
+  <div id="shareForm" class="bar"><button id="addShareBtn">新增共保人</button><button id="saveSharesBtn">保存份额</button></div>
+
+  <h2 id="linesTitle">结算明细</h2>
+  <table id="lines"><thead><tr><th>受损标的</th><th>单项赔款</th><th>共保人</th><th>份额 %</th><th>分摊金额</th></tr></thead>
+  <tbody></tbody><tfoot><tr><td colspan="4">合计</td><td class="num" id="sumLines"></td></tr></tfoot></table>
+  <div class="bar"><button id="finalizeBtn">核定并冻结本版结算</button><span class="muted">核定后本版定损项、份额与结算明细全部冻结，旧版本永久可查。</span></div>
+</div>
+<script>
+const $ = s => document.querySelector(s);
+const S = {claimId:null, versions:[], detail:null, blockers:null, claim:null, shareEdit:[]};
+const esc = s => String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+const money = n => Number(n).toLocaleString('zh-CN',{minimumFractionDigits:2,maximumFractionDigits:2});
+const role = () => $('#role').value;
+const canEditItems = () => ['adjuster','supervisor'].includes(role());
+const canManage = () => role() === 'supervisor';
+const isDraft = () => S.detail && S.detail.version.status === 'draft';
+
+function showErr(e){ const el=$('#err'); el.style.display = e ? 'block' : 'none'; el.textContent = e ? ('错误：' + (e.message||e)) : ''; }
+function hdrs(){ return {'X-User': $('#user').value.trim(), 'X-Role': role(), 'Content-Type':'application/json'}; }
+async function api(path, opts={}){
+  const r = await fetch(path, {...opts, headers: hdrs()});
+  const d = await r.json().catch(()=>({}));
+  if(!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
+  return d;
+}
+const post = (path, body) => api(path, {method:'POST', body: JSON.stringify(body||{})});
+
+function itemPayout(it){ return Math.round((it.insured_amount*it.loss_ratio - it.salvage_value - it.deductible)*100)/100; }
+function previewSplit(items, shares){ // 与 settlement_calc.split_settlement 同口径的试算预览
+  const lines=[]; let total=0;
+  for(const it of items){
+    const payout = itemPayout(it); total += payout;
+    let allocated = 0;
+    const amounts = shares.map(s => { const a = Math.round(payout*s.share_pct)/100; allocated += a; return a; });
+    if(amounts.length){
+      const drift = Math.round((payout-allocated)*100)/100;
+      let top = 0; shares.forEach((s,i)=>{ if(s.share_pct > shares[top].share_pct) top = i; });
+      amounts[top] = Math.round((amounts[top]+drift)*100)/100;
+    }
+    shares.forEach((s,i)=>lines.push({item_name:it.item_name, item_payout:payout, insurer:s.insurer, share_pct:s.share_pct, amount:amounts[i]}));
+  }
+  return {lines, total: Math.round(total*100)/100};
+}
+
+async function load(){
+  showErr(null);
+  S.claimId = parseInt($('#claimId').value, 10);
+  if(!S.claimId){ showErr(new Error('请填写案件 ID')); return; }
+  const [vs, cur] = await Promise.all([
+    api('/api/settlements/versions?claim_id=' + S.claimId),
+    api('/api/settlements?claim_id=' + S.claimId),
+  ]);
+  S.versions = vs.versions; S.claim = cur.claim;
+  applyDetail(cur);
+  $('#main').style.display = 'block';
+}
+function applyDetail(cur){
+  S.detail = cur.settlement; S.blockers = cur.blockers;
+  S.shareEdit = S.detail && isDraft() ? S.detail.shares.map(s => ({insurer:s.insurer, share_pct:s.share_pct})) : [];
+  render();
+}
+async function selectVersion(){
+  showErr(null);
+  const v = $('#versionSel').value;
+  const cur = await api('/api/settlements?claim_id=' + S.claimId + (v ? '&version=' + v : ''));
+  applyDetail(cur);
+}
+
+function render(){
+  const c = S.claim;
+  $('#claimInfo').textContent = c ? `案件 ${c.claim_no}｜状态 ${c.status}｜预估损失 ${money(c.estimated_loss)}｜最终核定 ${c.final_payout==null?'—':money(c.final_payout)}` : '';
+  $('#versionSel').innerHTML = S.versions.map(v =>
+    `<option value="${v.version_no}" ${S.detail && v.version_no===S.detail.version.version_no?'selected':''}>v${v.version_no}（${v.status==='draft'?'草稿':'已核定'}${v.total_payout!=null?'，'+money(v.total_payout):''}）</option>`).join('');
+  const vb = $('#versionBadge'), vm = $('#versionMeta');
+  if(S.detail){
+    const v = S.detail.version;
+    vb.innerHTML = `<span class="badge ${v.status}">${v.status==='draft'?'草稿（可编辑）':'已核定（冻结）'}</span>`;
+    vm.textContent = `创建 ${v.created_by} ${v.created_at}${v.finalized_at?('｜核定 '+v.finalized_by+' '+v.finalized_at):''}${v.note?('｜'+v.note):''}`;
+  } else { vb.innerHTML=''; vm.textContent='尚无定损版本，请新建。'; }
+
+  const items = S.detail ? S.detail.items : [];
+  const shares = S.detail ? S.detail.shares : [];
+  $('#items tbody').innerHTML = items.map(it => {
+    const p = it.payout != null ? it.payout : itemPayout(it);
+    return `<tr><td>${esc(it.item_name)}</td><td class="num">${money(it.insured_amount)}</td><td class="num">${(it.loss_ratio*100).toFixed(1)}%</td>`+
+      `<td class="num">${money(it.salvage_value)}</td><td class="num">${money(it.deductible)}</td><td class="num">${money(p)}</td>`+
+      `<td>${it.review_status==='reviewed'?'✅ 已复核':'⏳ 待复核'}</td>`+
+      `<td class="editOnly">${isDraft()&&canEditItems()?`<button onclick="reviewItem(${it.id},'${it.review_status==='reviewed'?'draft':'reviewed'}')">${it.review_status==='reviewed'?'撤销复核':'复核'}</button><button onclick="removeItem(${it.id})">删除</button>`:''}</td></tr>`;
+  }).join('') || '<tr><td colspan="8" class="muted">暂无定损项</td></tr>';
+  $('#sumInsured').textContent = money(items.reduce((a,b)=>a+b.insured_amount,0));
+  $('#sumPayout').textContent = money(items.reduce((a,b)=>a+(b.payout!=null?b.payout:itemPayout(b)),0));
+
+  if(isDraft()){
+    $('#shares tbody').innerHTML = S.shareEdit.map((s,i) =>
+      `<tr><td><input value="${esc(s.insurer)}" placeholder="共保人名称" oninput="S.shareEdit[${i}].insurer=this.value"></td>`+
+      `<td><input type="number" min="0" max="100" step="0.01" value="${s.share_pct}" style="width:7em" oninput="S.shareEdit[${i}].share_pct=parseFloat(this.value)||0;renderShareTotal()"></td>`+
+      `<td class="editOnly"><button onclick="S.shareEdit.splice(${i},1);render()">删除</button></td></tr>`).join('') || '<tr><td colspan="3" class="muted">尚未维护共保人</td></tr>';
+  } else {
+    $('#shares tbody').innerHTML = shares.map(s =>
+      `<tr><td>${esc(s.insurer)}</td><td class="num">${s.share_pct.toFixed(2)}</td><td class="editOnly"></td></tr>`).join('') || '<tr><td colspan="3" class="muted">无</td></tr>';
+  }
+  renderShareTotal();
+
+  const lines = S.detail ? S.detail.lines : [];
+  let shown = lines, title = '结算明细', total = S.detail && S.detail.version.total_payout;
+  if(isDraft()){
+    const pv = previewSplit(items, S.shareEdit.filter(s=>s.insurer && s.share_pct>0));
+    shown = pv.lines; total = pv.total; title = '结算明细（试算预览，以核定为准）';
+  }
+  $('#linesTitle').textContent = title;
+  $('#lines tbody').innerHTML = shown.map(l =>
+    `<tr><td>${esc(l.item_name)}</td><td class="num">${money(l.item_payout)}</td><td>${esc(l.insurer)}</td><td class="num">${l.share_pct.toFixed(2)}</td><td class="num">${money(l.amount)}</td></tr>`).join('') || '<tr><td colspan="5" class="muted">暂无结算明细</td></tr>';
+  $('#sumLines').textContent = total!=null ? money(total) : '—';
+
+  const bl = S.blockers || [];
+  $('#blockersBox').style.display = isDraft() && bl.length ? 'block' : 'none';
+  $('#blockers').innerHTML = bl.map(b=>`<li>${esc(b)}</li>`).join('');
+  $('#readyBox').style.display = isDraft() && !bl.length && items.length ? 'block' : 'none';
+
+  const edit = isDraft();
+  document.querySelectorAll('.editOnly').forEach(el => el.style.display = edit ? '' : 'none');
+  $('#itemForm').style.display = edit && canEditItems() ? 'flex' : 'none';
+  $('#shareForm').style.display = edit && canManage() ? 'flex' : 'none';
+  $('#newVersionBtn').style.display = canManage() && S.detail && !isDraft() ? '' : 'none';
+  if(!S.detail) $('#newVersionBtn').style.display = canManage() ? '' : 'none';
+  const fb = $('#finalizeBtn');
+  fb.style.display = edit && canManage() ? '' : 'none';
+  fb.disabled = !!(bl.length || !items.length);
+  fb.title = fb.disabled ? '存在未满足的核定条件，见上方红色清单' : '';
+}
+function renderShareTotal(){
+  const t = S.shareEdit.reduce((a,b)=>a+(b.share_pct||0),0);
+  $('#sumShare').textContent = isDraft() ? t.toFixed(2) + ' %' : (S.detail ? S.detail.shares.reduce((a,b)=>a+b.share_pct,0).toFixed(2) + ' %' : '—');
+}
+
+async function reviewItem(id, status){ try{ await post('/api/settlements/items/review', {claim_id:S.claimId, item_id:id, review_status:status}); await load(); }catch(e){ showErr(e); } }
+async function removeItem(id){ try{ if(!confirm('删除该定损项？')) return; await post('/api/settlements/items/remove', {claim_id:S.claimId, item_id:id}); await load(); }catch(e){ showErr(e); } }
+async function addItem(){ try{
+  await post('/api/settlements/items', {claim_id:S.claimId, item_name:$('#itName').value, insured_amount:parseFloat($('#itInsured').value),
+    loss_ratio:parseFloat($('#itRatio').value), salvage_value:parseFloat($('#itSalvage').value)||0, deductible:parseFloat($('#itDeduct').value)||0});
+  ['itName','itInsured','itRatio','itSalvage','itDeduct'].forEach(id=>$('#'+id).value=''); await load();
+}catch(e){ showErr(e); } }
+async function saveShares(){ try{
+  await post('/api/settlements/shares', {claim_id:S.claimId, shares:S.shareEdit.filter(s=>s.insurer && s.insurer.trim())}); await load();
+}catch(e){ showErr(e); } }
+async function newVersion(){ try{
+  const note = prompt('版本说明（如：补证新增设备损失）') || '';
+  await post('/api/settlements/version', {claim_id:S.claimId, note}); await load();
+}catch(e){ showErr(e); } }
+async function finalize(){ try{
+  if(!confirm('核定后本版定损与结算明细将冻结，确认核定？')) return;
+  await post('/api/settlements/finalize', {claim_id:S.claimId}); await load();
+}catch(e){ showErr(e); await load(); } }
+
+$('#loadBtn').onclick = () => load().catch(showErr);
+$('#versionSel').onchange = () => selectVersion().catch(showErr);
+$('#addItemBtn').onclick = addItem;
+$('#addShareBtn').onclick = () => { S.shareEdit.push({insurer:'', share_pct:0}); render(); };
+$('#saveSharesBtn').onclick = saveShares;
+$('#newVersionBtn').onclick = newVersion;
+$('#finalizeBtn').onclick = finalize;
+$('#role').onchange = render;
+</script></html>
