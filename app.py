@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import os
+import re
 import sqlite3
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -12,9 +13,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import settlement_calc
+from settlement_store import SettlementStore
+
 ROOT = Path(__file__).resolve().parent
 DEFAULT_DB = ROOT / "catastrophe_claims.db"
 TERMINAL = {"duplicate", "approved", "rejected", "closed"}
+# 定损标的与共保份额允许维护的案件状态（核定后冻结，补证重开回到 review 可再调整）
+SETTLEMENT_EDITABLE = {"assigned", "survey", "review", "escalated"}
 TRANSITIONS = {
     "received": {"triaged"},
     "triaged": {"assigned", "escalated"},
@@ -26,9 +32,10 @@ TRANSITIONS = {
 
 
 class DomainError(Exception):
-    def __init__(self, message: str, status: int = 400):
+    def __init__(self, message: str, status: int = 400, extra: dict[str, Any] | None = None):
         super().__init__(message)
         self.status = status
+        self.extra = extra or {}
 
 
 def utcnow() -> str:
@@ -68,6 +75,7 @@ def coordinate(value: Any, label: str, low: float, high: float) -> float:
 class CatastropheClaimService:
     def __init__(self, db_path: str | os.PathLike[str] = DEFAULT_DB):
         self.db_path = str(db_path)
+        self.settlements = SettlementStore()
         self._init_schema()
 
     def connect(self) -> sqlite3.Connection:
@@ -149,6 +157,7 @@ class CatastropheClaimService:
                 CREATE INDEX IF NOT EXISTS idx_evidence_hash ON evidence(sha256);
                 """
             )
+            self.settlements.init_schema(conn)
 
     def _audit(self, conn: sqlite3.Connection, claim_id: int | None, actor: str, action: str, details: dict[str, Any]) -> None:
         conn.execute(
@@ -271,7 +280,8 @@ class CatastropheClaimService:
         with self.connect() as conn:
             conn.execute("BEGIN IMMEDIATE")
             claim = self._claim(conn, claim_id)
-            if claim["status"] in TERMINAL:
+            # 已核定(approved)案件仍允许补证附件，补证重开后生成新结算版本
+            if claim["status"] in {"duplicate", "rejected", "closed"}:
                 raise DomainError("已结束案件不能添加证据", 409)
             existing = conn.execute("SELECT * FROM evidence WHERE claim_id=? AND sha256=?", (claim_id, sha256)).fetchone()
             if existing:
@@ -397,6 +407,8 @@ class CatastropheClaimService:
                 raise DomainError("重复报案不能核定赔付", 409)
             if claim["fraud_score"] >= 0.8 and decision == "approve":
                 raise DomainError("高风险案件未解除风险标记，不能赔付", 409)
+            if decision == "approve" and self.settlements.has_items(conn, claim_id):
+                raise DomainError("案件已维护受损标的，请通过结算核定生成赔款", 409)
             if decision == "approve" and payout > claim["estimated_loss"]:
                 raise DomainError("核定金额不能超过预估损失", 409)
             if decision == "reject" and not reason.strip():
@@ -408,6 +420,187 @@ class CatastropheClaimService:
             )
             self._audit(conn, claim_id, actor, "claim.finalized", {"decision": decision, "payout": payout, "reason": reason.strip()})
             return dict(self._claim(conn, claim_id))
+
+    # ---- 逐项定损与共保结算（存储在 settlement_store，计算在 settlement_calc） ----
+
+    def _editable_claim(self, conn: sqlite3.Connection, claim_id: int) -> sqlite3.Row:
+        claim = self._claim(conn, claim_id)
+        if claim["status"] == "approved":
+            raise DomainError("结算明细已核定冻结，请先补证重开", 409)
+        if claim["status"] not in SETTLEMENT_EDITABLE:
+            raise DomainError("当前状态不能维护定损数据", 409)
+        return claim
+
+    def _settlement_view(self, conn: sqlite3.Connection, claim: sqlite3.Row) -> dict[str, Any]:
+        items = self.settlements.list_items(conn, claim["id"])
+        coinsurers = self.settlements.list_coinsurers(conn, claim["id"])
+        computed = []
+        for item in items:
+            row = dict(item)
+            row["payout"] = settlement_calc.item_payout(item)
+            computed.append(row)
+        issues = settlement_calc.readiness_issues(items, coinsurers)
+        if items and coinsurers:
+            preview = settlement_calc.split_settlement(items, coinsurers)
+        else:
+            preview = {"total_payout": 0.0, "lines": []}
+        return {
+            "claim": dict(claim),
+            "items": computed,
+            "coinsurers": coinsurers,
+            "share_total": round(sum(c["share_pct"] for c in coinsurers), 2),
+            "issues": issues,
+            "ready": not issues,
+            "editable": claim["status"] in SETTLEMENT_EDITABLE,
+            "preview": preview,
+            "versions": self.settlements.list_versions(conn, claim["id"]),
+        }
+
+    def settlement_view(self, actor: str, role: str, claim_id: int) -> dict[str, Any]:
+        if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
+            raise DomainError("角色无权查看结算信息", 403)
+        with self.connect() as conn:
+            return self._settlement_view(conn, self._claim(conn, claim_id))
+
+    def upsert_loss_item(self, actor: str, role: str, claim_id: int, name: str, sum_insured: float,
+                         loss_ratio: float, salvage: float = 0.0, deductible: float = 0.0) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "surveyor", "supervisor"}, "维护受损标的")
+        name = (name or "").strip()
+        if not name:
+            raise DomainError("标的名称不能为空")
+        try:
+            sum_insured = float(sum_insured)
+            loss_ratio = float(loss_ratio)
+            salvage = float(salvage)
+            deductible = float(deductible)
+        except (TypeError, ValueError) as exc:
+            raise DomainError("保额、损失比例、残值、免赔额必须是数值") from exc
+        if sum_insured <= 0:
+            raise DomainError("保额必须大于0")
+        if not 0 <= loss_ratio <= 1:
+            raise DomainError("损失比例应在 0 到 1 之间")
+        if salvage < 0 or deductible < 0:
+            raise DomainError("残值和免赔额不能为负数")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._editable_claim(conn, claim_id)
+            item_id, created = self.settlements.upsert_item(
+                conn, claim_id, name, sum_insured, loss_ratio, salvage, deductible, actor, utcnow())
+            self._audit(conn, claim_id, actor, "loss_item.upserted",
+                        {"item_id": item_id, "name": name, "created": created})
+            return self._settlement_view(conn, self._claim(conn, claim_id))
+
+    def delete_loss_item(self, actor: str, role: str, item_id: int) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "surveyor", "supervisor"}, "删除受损标的")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = self.settlements.get_item(conn, item_id)
+            if not item:
+                raise DomainError("受损标的不存在", 404)
+            self._editable_claim(conn, item["claim_id"])
+            self.settlements.delete_item(conn, item_id)
+            self._audit(conn, item["claim_id"], actor, "loss_item.deleted", {"item_id": item_id, "name": item["name"]})
+            return self._settlement_view(conn, self._claim(conn, item["claim_id"]))
+
+    def review_loss_item(self, actor: str, role: str, item_id: int) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "surveyor", "supervisor"}, "复核受损标的")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            item = self.settlements.get_item(conn, item_id)
+            if not item:
+                raise DomainError("受损标的不存在", 404)
+            self._editable_claim(conn, item["claim_id"])
+            if item["created_by"] == actor:
+                raise DomainError("录入人不能复核自己维护的标的", 409)
+            if not item["reviewed"]:
+                self.settlements.mark_reviewed(conn, item_id, actor, utcnow())
+                self._audit(conn, item["claim_id"], actor, "loss_item.reviewed",
+                            {"item_id": item_id, "name": item["name"]})
+            return self._settlement_view(conn, self._claim(conn, item["claim_id"]))
+
+    def set_coinsurers(self, actor: str, role: str, claim_id: int, coinsurers: list[dict[str, Any]]) -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "维护共保份额")
+        if not isinstance(coinsurers, list):
+            raise DomainError("共保人列表格式无效")
+        cleaned, seen = [], set()
+        for entry in coinsurers:
+            name = str(entry.get("name", "")).strip()
+            try:
+                share = float(entry.get("share_pct"))
+            except (TypeError, ValueError) as exc:
+                raise DomainError("共保份额必须是数值") from exc
+            if not name:
+                raise DomainError("共保人名称不能为空")
+            if name in seen:
+                raise DomainError("共保人重复：%s" % name)
+            if not 0 < share <= 100:
+                raise DomainError("共保份额应在 0 到 100 之间")
+            seen.add(name)
+            cleaned.append({"name": name, "share_pct": share})
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            self._editable_claim(conn, claim_id)
+            self.settlements.replace_coinsurers(conn, claim_id, cleaned, utcnow())
+            self._audit(conn, claim_id, actor, "coinsurers.updated", {"coinsurers": cleaned})
+            return self._settlement_view(conn, self._claim(conn, claim_id))
+
+    def approve_settlement(self, actor: str, role: str, claim_id: int,
+                           expected_version: int, note: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"supervisor"}, "结算核定")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] != "review":
+                raise DomainError("只有待复核案件可以核定结算", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            if claim["duplicate_of"]:
+                raise DomainError("重复报案不能核定赔付", 409)
+            if claim["fraud_score"] >= 0.8:
+                raise DomainError("高风险案件未解除风险标记，不能赔付", 409)
+            items = self.settlements.list_items(conn, claim_id)
+            coinsurers = self.settlements.list_coinsurers(conn, claim_id)
+            issues = settlement_calc.readiness_issues(items, coinsurers)
+            if issues:
+                raise DomainError("定损或共保信息不完整，无法核定", 409, {"issues": issues})
+            result = settlement_calc.split_settlement(items, coinsurers)
+            now = utcnow()
+            version_no = self.settlements.next_version_no(conn, claim_id)
+            version_id = self.settlements.create_version(
+                conn, claim_id, version_no, result["total_payout"], actor, (note or "").strip(), now)
+            self.settlements.insert_lines(conn, version_id, result["lines"])
+            conn.execute(
+                "UPDATE claims SET status='approved',final_payout=?,version=version+1,updated_at=? WHERE id=? AND version=?",
+                (result["total_payout"], now, claim_id, expected_version),
+            )
+            self._audit(conn, claim_id, actor, "settlement.approved",
+                        {"version_no": version_no, "total_payout": result["total_payout"], "lines": len(result["lines"])})
+            return self._settlement_view(conn, self._claim(conn, claim_id))
+
+    def supplement_settlement(self, actor: str, role: str, claim_id: int,
+                              expected_version: int, note: str = "") -> dict[str, Any]:
+        actor = actor_id(actor)
+        require_role(role, {"adjuster", "supervisor"}, "补证重开")
+        if not (note or "").strip():
+            raise DomainError("补证必须填写说明")
+        with self.connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            claim = self._claim(conn, claim_id)
+            if claim["status"] != "approved":
+                raise DomainError("只有已核定案件可以补证重开", 409)
+            if claim["version"] != int(expected_version):
+                raise DomainError("案件已变化，请刷新后重试", 409)
+            conn.execute(
+                "UPDATE claims SET status='review',version=version+1,updated_at=? WHERE id=? AND version=?",
+                (utcnow(), claim_id, expected_version),
+            )
+            self._audit(conn, claim_id, actor, "settlement.supplement", {"note": note.strip()})
+            return self._settlement_view(conn, self._claim(conn, claim_id))
 
     def queue(self, role: str = "viewer", actor: str = "") -> list[dict[str, Any]]:
         if role not in {"intake", "supervisor", "adjuster", "surveyor", "auditor"}:
@@ -466,6 +659,19 @@ class ApiHandler(BaseHTTPRequestHandler):
     def _headers(self) -> tuple[str, str]:
         return self.headers.get("X-User", ""), self.headers.get("X-Role", "viewer")
 
+    def _error(self, exc: DomainError) -> None:
+        payload = {"error": str(exc)}
+        payload.update(exc.extra)
+        self._send(exc.status, payload)
+
+    def _serve_html(self, name: str) -> None:
+        body = (ROOT / "static" / name).read_bytes()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _json(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0"))
         if length > 2_000_000:
@@ -484,12 +690,10 @@ class ApiHandler(BaseHTTPRequestHandler):
         try:
             path = urlparse(self.path).path
             if path in {"/", "/index.html"}:
-                body = (ROOT / "static" / "index.html").read_bytes()
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
+                self._serve_html("index.html")
+                return
+            if path in {"/settlement", "/settlement.html"}:
+                self._serve_html("settlement.html")
                 return
             if path == "/health":
                 self._send(200, {"status": "ok", "service": "catastrophe-claims"})
@@ -499,9 +703,14 @@ class ApiHandler(BaseHTTPRequestHandler):
                 actor, role = self._headers()
                 self._send(200, {"queue": self.service.queue(role, actor)})
             else:
-                self._send(404, {"error": "接口不存在"})
+                match = re.fullmatch(r"/api/claims/(\d+)/settlement", path)
+                if match:
+                    actor, role = self._headers()
+                    self._send(200, self.service.settlement_view(actor, role, int(match.group(1))))
+                else:
+                    self._send(404, {"error": "接口不存在"})
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            self._error(exc)
 
     def do_POST(self) -> None:
         try:
@@ -522,11 +731,23 @@ class ApiHandler(BaseHTTPRequestHandler):
                 result = self.service.emergency_advance(actor, role, **data)
             elif path == "/api/claims/finalize":
                 result = self.service.finalize_claim(actor, role, **data)
+            elif path == "/api/loss-items":
+                result = self.service.upsert_loss_item(actor, role, **data)
+            elif path == "/api/loss-items/delete":
+                result = self.service.delete_loss_item(actor, role, **data)
+            elif path == "/api/loss-items/review":
+                result = self.service.review_loss_item(actor, role, **data)
+            elif path == "/api/coinsurers":
+                result = self.service.set_coinsurers(actor, role, **data)
+            elif path == "/api/claims/settlement/approve":
+                result = self.service.approve_settlement(actor, role, **data)
+            elif path == "/api/claims/settlement/supplement":
+                result = self.service.supplement_settlement(actor, role, **data)
             else:
                 raise DomainError("接口不存在", 404)
             self._send(201, result)
         except DomainError as exc:
-            self._send(exc.status, {"error": str(exc)})
+            self._error(exc)
         except (KeyError, TypeError, ValueError) as exc:
             self._send(400, {"error": "请求参数错误: %s" % exc})
         except Exception as exc:

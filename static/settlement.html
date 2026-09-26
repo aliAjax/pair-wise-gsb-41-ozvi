@@ -1,0 +1,178 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<title>巨灾理赔 · 定损结算核定</title>
+<style>
+body{font:15px/1.6 system-ui,sans-serif;max-width:1200px;margin:28px auto;padding:0 20px;color:#263746}
+table{border-collapse:collapse;width:100%;margin:14px 0}
+th,td{border:1px solid #d3dce3;padding:7px;text-align:left}
+th{background:#f1f5f7}
+.card{background:#fff8eb;border-left:5px solid #d58b21;padding:12px 16px;margin-bottom:14px}
+.panel{background:#f7fafb;border:1px solid #dfe7ec;padding:12px 16px;margin:14px 0}
+.bad{color:#b3261e}.ok{color:#1e7e34}
+input,select{padding:5px;margin:3px}
+button{padding:6px 14px;margin:3px;cursor:pointer}
+button:disabled{opacity:.45;cursor:not-allowed}
+.num{text-align:right;font-variant-numeric:tabular-nums}
+.tag{background:#eef2f4;padding:2px 6px;border-radius:3px;font-size:13px}
+#err{background:#fdecea;border:1px solid #f5c6c0;padding:8px 12px;margin:10px 0;display:none;white-space:pre-wrap}
+h2{font-size:18px;margin:6px 0}
+</style>
+<h1>巨灾理赔 · 逐项定损与结算核定</h1>
+<div class="card">
+  操作人 <input id="user" value="sup1" size="8">
+  角色 <select id="role"><option>supervisor</option><option>adjuster</option><option>surveyor</option><option>intake</option><option>auditor</option></select>
+  案件 <select id="claimSel"></select>
+  <button onclick="loadView()">加载</button>
+  <span id="claimInfo"></span>
+  <div style="margin-top:6px">写入接口按请求头 <code>X-User</code>/<code>X-Role</code> 鉴权；本页用上方输入作为请求头。返回 <a href="/">状态页</a>。</div>
+</div>
+<div id="err"></div>
+
+<div class="panel">
+<h2>受损标的（逐项定损）</h2>
+<table id="items"><thead><tr><th>标的</th><th>保额</th><th>损失比例</th><th>残值</th><th>免赔额</th><th>试算赔款</th><th>复核</th><th>操作</th></tr></thead><tbody></tbody></table>
+<div>
+  <input id="itName" placeholder="标的名称">
+  <input id="itSum" type="number" placeholder="保额" style="width:120px">
+  <input id="itRatio" type="number" step="0.01" min="0" max="1" placeholder="损失比例 0-1" style="width:110px">
+  <input id="itSalvage" type="number" placeholder="残值" style="width:100px">
+  <input id="itDed" type="number" placeholder="免赔额" style="width:100px">
+  <button id="itemSaveBtn" onclick="saveItem()">保存标的</button>
+  <span class="tag">同名标的保存即更新；更新后复核状态重置，需重新复核</span>
+</div>
+</div>
+
+<div class="panel">
+<h2>共保份额</h2>
+<table id="coins"><thead><tr><th>共保人</th><th>份额%</th><th></th></tr></thead><tbody></tbody></table>
+<input id="coName" placeholder="共保人"><input id="coShare" type="number" step="0.01" placeholder="份额%" style="width:100px">
+<button id="coinAddBtn" onclick="addCoin()">加入列表</button><button id="coinSaveBtn" onclick="saveCoins()">保存份额</button>
+<span id="coinTotal"></span>
+</div>
+
+<div class="panel">
+<h2>核定前检查</h2>
+<ul id="issues"></ul>
+<div id="ready"></div>
+</div>
+
+<div class="panel">
+<h2>结算预览（按份额拆分）</h2>
+<table id="preview"><thead><tr><th>标的</th><th>该项赔款</th><th>共保人</th><th>份额%</th><th>分摊金额</th></tr></thead><tbody></tbody><tfoot></tfoot></table>
+核定/补证说明 <input id="note" placeholder="说明" size="30">
+<button id="approveBtn" onclick="approve()">核定并冻结明细</button>
+<button id="suppBtn" onclick="supplement()">补证重开（生成新版本）</button>
+</div>
+
+<div class="panel">
+<h2>历史结算版本（冻结，仅可查询）</h2>
+<div id="versions">暂无</div>
+</div>
+
+<script>
+let view = null, coins = [];
+const $ = id => document.getElementById(id);
+const fmt = n => Number(n).toLocaleString('zh-CN', {minimumFractionDigits: 2, maximumFractionDigits: 2});
+const hdrs = () => ({'Content-Type': 'application/json', 'X-User': $('user').value, 'X-Role': $('role').value});
+
+function showErr(e) {
+  const el = $('err'); el.style.display = 'block';
+  let t = e.error || String(e);
+  if (e.issues) t += '\n' + e.issues.map(i => '· ' + i.message).join('\n');
+  el.textContent = t;
+}
+async function api(path, body) {
+  const r = await fetch(path, body ? {method: 'POST', headers: hdrs(), body: JSON.stringify(body)} : {headers: hdrs()});
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) { showErr(d); throw new Error(d.error || r.status); }
+  $('err').style.display = 'none';
+  return d;
+}
+async function init() {
+  const d = await api('/api/state');
+  $('claimSel').innerHTML = d.claims.map(c => `<option value="${c.id}">${c.claim_no}（${c.status}）</option>`).join('');
+  if (d.claims.length) loadView();
+}
+async function loadView() {
+  view = await api('/api/claims/' + $('claimSel').value + '/settlement');
+  coins = view.coinsurers.map(c => ({name: c.name, share_pct: c.share_pct}));
+  render();
+}
+function render() {
+  const c = view.claim, ed = view.editable;
+  $('claimInfo').innerHTML = `状态 <b>${c.status}</b> · 版本 ${c.version}` +
+    (c.final_payout != null ? ` · 核定赔款 <b>${fmt(c.final_payout)}</b>` : '') +
+    (ed ? '' : ' · <span class="bad">定损数据已冻结</span>');
+  $('items').querySelector('tbody').innerHTML = view.items.map((it, i) => `<tr>
+    <td>${it.name}</td><td class="num">${fmt(it.sum_insured)}</td><td class="num">${it.loss_ratio}</td>
+    <td class="num">${fmt(it.salvage)}</td><td class="num">${fmt(it.deductible)}</td>
+    <td class="num ${it.payout < 0 ? 'bad' : ''}">${fmt(it.payout)}</td>
+    <td>${it.reviewed ? '已复核 ' + it.reviewed_by : '<span class="bad">未复核</span>'}</td>
+    <td>${ed ? `<button onclick="fillItem(${i})">编辑</button>` : ''}
+        ${ed && !it.reviewed ? `<button onclick="reviewItem(${it.id})">复核</button>` : ''}
+        ${ed ? `<button onclick="delItem(${it.id})">删除</button>` : ''}</td></tr>`).join('')
+    || '<tr><td colspan="8">尚未维护受损标的</td></tr>';
+  for (const id of ['itName','itSum','itRatio','itSalvage','itDed','itemSaveBtn','coName','coShare','coinAddBtn','coinSaveBtn'])
+    $(id).disabled = !ed;
+  renderCoins();
+  $('issues').innerHTML = view.issues.map(i => `<li class="bad">${i.message}</li>`).join('');
+  $('ready').innerHTML = view.ready
+    ? '<span class="ok">✔ 定损与共保信息完整，可以核定</span>'
+    : '<span class="bad">✘ 存在 ' + view.issues.length + ' 项阻断，主管无法核定</span>';
+  const lines = view.preview.lines;
+  $('preview').querySelector('tbody').innerHTML = lines.map(l => `<tr>
+    <td>${l.item_name}</td><td class="num">${fmt(l.item_payout)}</td><td>${l.coinsurer}</td>
+    <td class="num">${l.share_pct}</td><td class="num">${fmt(l.amount)}</td></tr>`).join('')
+    || '<tr><td colspan="5">暂无（需先维护标的与共保份额）</td></tr>';
+  $('preview').querySelector('tfoot').innerHTML = lines.length
+    ? `<tr><th colspan="4">合计赔款</th><th class="num">${fmt(view.preview.total_payout)}</th></tr>` : '';
+  $('approveBtn').disabled = !(ed && view.ready && c.status === 'review');
+  $('suppBtn').style.display = c.status === 'approved' ? '' : 'none';
+  $('versions').innerHTML = view.versions.map(v => `
+    <h3>版本 ${v.version_no} · 总赔款 ${fmt(v.total_payout)} · ${v.approved_by} 核定于 ${v.approved_at}${v.note ? ' · ' + v.note : ''}</h3>
+    <table><thead><tr><th>标的</th><th>该项赔款</th><th>共保人</th><th>份额%</th><th>分摊金额</th></tr></thead>
+    <tbody>${v.lines.map(l => `<tr><td>${l.item_name}</td><td class="num">${fmt(l.item_payout)}</td>
+      <td>${l.coinsurer}</td><td class="num">${l.share_pct}</td><td class="num">${fmt(l.amount)}</td></tr>`).join('')}</tbody></table>`
+  ).join('') || '暂无';
+}
+function renderCoins() {
+  const total = coins.reduce((s, c) => s + Number(c.share_pct), 0);
+  $('coins').querySelector('tbody').innerHTML = coins.map((c, i) => `<tr>
+    <td>${c.name}</td><td class="num">${c.share_pct}</td>
+    <td>${view.editable ? `<button onclick="coins.splice(${i},1);renderCoins()">移除</button>` : ''}</td></tr>`).join('')
+    || '<tr><td colspan="3">尚未维护共保人</td></tr>';
+  $('coinTotal').innerHTML = `合计 <b class="${Math.abs(total - 100) < 0.01 ? 'ok' : 'bad'}">${total.toFixed(2)}%</b>（须等于 100%）`;
+}
+function fillItem(i) {
+  const it = view.items[i];
+  $('itName').value = it.name; $('itSum').value = it.sum_insured; $('itRatio').value = it.loss_ratio;
+  $('itSalvage').value = it.salvage; $('itDed').value = it.deductible;
+}
+async function saveItem() {
+  await api('/api/loss-items', {claim_id: view.claim.id, name: $('itName').value, sum_insured: $('itSum').value,
+    loss_ratio: $('itRatio').value, salvage: $('itSalvage').value || 0, deductible: $('itDed').value || 0});
+  await loadView();
+}
+async function delItem(id) { await api('/api/loss-items/delete', {item_id: id}); await loadView(); }
+async function reviewItem(id) { await api('/api/loss-items/review', {item_id: id}); await loadView(); }
+function addCoin() {
+  if (!$('coName').value.trim() || !$('coShare').value) return;
+  coins.push({name: $('coName').value.trim(), share_pct: Number($('coShare').value)});
+  $('coName').value = ''; $('coShare').value = '';
+  renderCoins();
+}
+async function saveCoins() { await api('/api/coinsurers', {claim_id: view.claim.id, coinsurers: coins}); await loadView(); }
+async function approve() {
+  await api('/api/claims/settlement/approve', {claim_id: view.claim.id, expected_version: view.claim.version, note: $('note').value});
+  await loadView();
+}
+async function supplement() {
+  const note = $('note').value.trim() || prompt('补证说明');
+  if (!note) return;
+  await api('/api/claims/settlement/supplement', {claim_id: view.claim.id, expected_version: view.claim.version, note});
+  await loadView();
+}
+init().catch(showErr);
+</script>
+</html>
